@@ -12,23 +12,30 @@ func ApplyMigrations(dir migrate.MigrationDirection, dryrun bool, limit int, ver
 		return fmt.Errorf("Could not parse config: %w", err)
 	}
 
-	db, dialect, err := GetConnection(env)
+	db, dialects, err := GetConnection(env)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
+	// No need to set verbose mode, it's already handled via the environment struct
+
 	source := migrate.FileMigrationSource{
 		Dir: env.Dir,
+	}
+
+	dialect, ok := dialects[env.Dialect]
+	if !ok {
+		return fmt.Errorf("Unsupported dialect: %s", env.Dialect)
 	}
 
 	if dryrun {
 		var migrations []*migrate.PlannedMigration
 
 		if version >= 0 {
-			migrations, _, err = migrate.PlanMigrationToVersion(db, dialect, source, dir, version)
+			migrations, _, err = migrate.PlanMigrationToVersionWithGorp(db, dialect, source, dir, version)
 		} else {
-			migrations, _, err = migrate.PlanMigration(db, dialect, source, dir, limit)
+			migrations, _, err = migrate.PlanMigrationWithGorp(db, dialect, source, dir, limit)
 		}
 
 		if err != nil {
@@ -42,9 +49,9 @@ func ApplyMigrations(dir migrate.MigrationDirection, dryrun bool, limit int, ver
 		var n int
 
 		if version >= 0 {
-			n, err = migrate.ExecVersion(db, dialect, source, dir, version)
+			n, err = migrate.ExecVersionWithGorp(db, dialect, source, dir, version)
 		} else {
-			n, err = migrate.ExecMax(db, dialect, source, dir, limit)
+			n, err = migrate.ExecMaxWithGorp(db, dialect, source, dir, limit)
 		}
 
 		if err != nil {

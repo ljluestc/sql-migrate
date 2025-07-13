@@ -57,17 +57,25 @@ func SkipMigrations(dir migrate.MigrationDirection, limit int) error {
 		return fmt.Errorf("Could not parse config: %w", err)
 	}
 
-	db, dialect, err := GetConnection(env)
+	db, dialects, err := GetConnection(env)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
+	dialect, ok := dialects[env.Dialect]
+	if !ok {
+		return fmt.Errorf("Unsupported dialect: %s", env.Dialect)
+	}
+
+	// Set verbose mode if enabled
+	migrate.Verbose = env.Verbose
+
 	source := migrate.FileMigrationSource{
 		Dir: env.Dir,
 	}
 
-	n, err := migrate.SkipMax(db, dialect, source, dir, limit)
+	n, err := migrate.SkipMaxWithGorp(db, dialect, source, dir, limit)
 	if err != nil {
 		return fmt.Errorf("Migration failed: %w", err)
 	}

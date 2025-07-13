@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-gorp/gorp/v3"
 	"github.com/olekukonko/tablewriter"
 
 	migrate "github.com/rubenv/sql-migrate"
@@ -48,12 +49,21 @@ func (c *StatusCommand) Run(args []string) int {
 		return 1
 	}
 
-	db, dialect, err := GetConnection(env)
+	db, dialects, err := GetConnection(env)
 	if err != nil {
 		ui.Error(err.Error())
 		return 1
 	}
 	defer db.Close()
+
+	dialect, ok := dialects[env.Dialect]
+	if !ok {
+		ui.Error(fmt.Sprintf("Unsupported dialect: %s", env.Dialect))
+		return 1
+	}
+
+	// Create DbMap instance with gorp.Dialect
+	dbMap := &gorp.DbMap{Db: db, Dialect: dialect}
 
 	source := migrate.FileMigrationSource{
 		Dir: env.Dir,
@@ -64,7 +74,25 @@ func (c *StatusCommand) Run(args []string) int {
 		return 1
 	}
 
-	records, err := migrate.GetMigrationRecords(db, dialect)
+	// We need to create our own migration set to get records
+	ms := migrate.MigrationSet{}
+	if env.TableName != "" {
+		ms.TableName = env.TableName
+	}
+	if env.SchemaName != "" {
+		ms.SchemaName = env.SchemaName
+	}
+
+	tableName := migrate.GetMigrationTableName()
+	if env.TableName != "" {
+		tableName = env.TableName
+	}
+
+	var records []*migrate.MigrationRecord
+	query := fmt.Sprintf("SELECT * FROM %s ORDER BY %s ASC",
+		dialect.QuotedTableForQuery(env.SchemaName, tableName),
+		dialect.QuoteField("id"))
+	_, err = dbMap.Select(&records, query)
 	if err != nil {
 		ui.Error(err.Error())
 		return 1

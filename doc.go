@@ -68,6 +68,7 @@ Use the --help flag in combination with any of the commands to get an overview o
 	  -env="development"   Environment.
 	  -limit=0             Limit the number of migrations (0 = unlimited).
 	  -dryrun              Don't apply migrations, just print them.
+	  -verbose             Print SQL statements as they are executed.
 
 The up command applies all available migrations. By contrast, down will only apply one migration by default. This behavior can be changed for both by using the -limit parameter.
 

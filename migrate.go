@@ -43,16 +43,23 @@ type MigrationSet struct {
 	IgnoreUnknown bool
 	// DisableCreateTable disable the creation of the migration table
 	DisableCreateTable bool
+	// TablePrefix prefix to use for the migration table
+	TablePrefix string
 }
 
 var migSet = MigrationSet{}
 
-// NewMigrationSet returns a parametrized Migration object
+// getTableName returns the migration table name
 func (ms MigrationSet) getTableName() string {
 	if ms.TableName == "" {
 		return "gorp_migrations"
 	}
 	return ms.TableName
+}
+
+// NewMigrationSet returns a parametrized Migration object
+func NewMigrationSet() MigrationSet {
+	return MigrationSet{}
 }
 
 var numberPrefixRegex = regexp.MustCompile(`^(\d+).*$`)
@@ -103,6 +110,11 @@ func SetTable(name string) {
 	if name != "" {
 		migSet.TableName = name
 	}
+}
+
+// GetMigrationTableName returns the name of the migration table
+func GetMigrationTableName() string {
+	return migSet.getTableName()
 }
 
 // SetSchema sets the name of a schema that the migration table be referenced.
@@ -182,29 +194,15 @@ type MigrationRecord struct {
 	AppliedAt time.Time `db:"applied_at"`
 }
 
-type OracleDialect struct {
-	gorp.OracleDialect
-}
-
-func (OracleDialect) IfTableNotExists(command, _, _ string) string {
-	return command
-}
-
-func (OracleDialect) IfSchemaNotExists(command, _ string) string {
-	return command
-}
-
-func (OracleDialect) IfTableExists(command, _, _ string) string {
-	return command
-}
+// Use dialect types that implement the gorp.Dialect interface
 
 var MigrationDialects = map[string]gorp.Dialect{
 	"sqlite3":   gorp.SqliteDialect{},
 	"postgres":  gorp.PostgresDialect{},
 	"mysql":     gorp.MySQLDialect{Engine: "InnoDB", Encoding: "UTF8"},
 	"mssql":     gorp.SqlServerDialect{},
-	"oci8":      OracleDialect{},
-	"godror":    OracleDialect{},
+	"oci8":      gorp.OracleDialect{},
+	"godror":    gorp.OracleDialect{},
 	"snowflake": gorp.SnowflakeDialect{},
 }
 
@@ -254,6 +252,116 @@ var _ MigrationSource = (*FileMigrationSource)(nil)
 func (f FileMigrationSource) FindMigrations() ([]*Migration, error) {
 	filesystem := http.Dir(f.Dir)
 	return findMigrations(filesystem, "/")
+}
+
+// A common method to plan a migration.
+func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, max int, version int64) ([]*PlannedMigration, *gorp.DbMap, error) {
+	dbMap, err := ms.getMigrationDbMap(db, dialect)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return ms.planMigrationImpl(dbMap, m, dir, max, version)
+}
+
+func (ms MigrationSet) planMigrationImpl(dbMap *gorp.DbMap, m MigrationSource, dir MigrationDirection, max int, version int64) ([]*PlannedMigration, *gorp.DbMap, error) {
+	migrations, err := m.FindMigrations()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var migrationRecords []MigrationRecord
+	tableName := fmt.Sprintf("%s%s", ms.TablePrefix, ms.TableName)
+	if ms.SchemaName != "" {
+		tableName = fmt.Sprintf("%s.%s", ms.SchemaName, tableName)
+	}
+
+	if _, err := dbMap.Exec(fmt.Sprintf("select * from %s limit 1", tableName)); err != nil {
+		return nil, nil, createMigrationTableIfNotExists(dbMap, ms.SchemaName, ms.TableName, ms.TablePrefix)
+	}
+
+	query := fmt.Sprintf("SELECT id, applied_at FROM %s ORDER BY id ASC", tableName)
+	if _, err := dbMap.Select(&migrationRecords, query); err != nil {
+		return nil, nil, err
+	}
+
+	// Apply migrations
+	var planned []*PlannedMigration
+	for _, migration := range migrations {
+		if dir == Up && max > 0 && len(planned) >= max {
+			break
+		}
+
+		// If we have a target version, we run migrations until we hit it
+		if version > 0 && migration.isNumeric() {
+			if dir == Up && migration.VersionInt() > version {
+				break
+			}
+			if dir == Down && migration.VersionInt() <= version {
+				break
+			}
+		}
+
+		if dir == Down {
+			// Downgrades are applied in reverse order
+			applied := false
+			for _, record := range migrationRecords {
+				if record.Id == migration.Id {
+					applied = true
+					break
+				}
+			}
+
+			if !applied {
+				continue
+			}
+		} else if dir == Up {
+			// Upgrades are applied in forward order
+			applied := false
+			for _, record := range migrationRecords {
+				if record.Id == migration.Id {
+					applied = true
+					break
+				}
+			}
+
+			if applied {
+				continue
+			}
+		}
+
+		p := &PlannedMigration{
+			Migration:          migration,
+			DisableTransaction: strings.Contains(migration.Id, "-- +migrate DisableTransaction"),
+		}
+
+		if dir == Up {
+			p.Queries = migration.Up
+		} else {
+			p.Queries = migration.Down
+		}
+
+		if len(p.Queries) > 0 {
+			planned = append(planned, p)
+		}
+	}
+
+	return planned, dbMap, nil
+}
+
+func createMigrationTableIfNotExists(dbMap *gorp.DbMap, schemaName string, tableName string, tablePrefix string) error {
+	fullTableName := fmt.Sprintf("%s%s", tablePrefix, tableName)
+	if schemaName != "" {
+		fullTableName = fmt.Sprintf("%s.%s", schemaName, fullTableName)
+	}
+
+	sqlCreate := fmt.Sprintf("CREATE TABLE %s (id VARCHAR(255) NOT NULL, applied_at TIMESTAMP NOT NULL, PRIMARY KEY(id))", fullTableName)
+
+	if _, err := dbMap.Exec(sqlCreate); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func findMigrations(dir http.FileSystem, root string) ([]*Migration, error) {
@@ -612,6 +720,16 @@ func PlanMigrationToVersion(db *sql.DB, dialect string, m MigrationSource, dir M
 	return migSet.PlanMigrationToVersion(db, dialect, m, dir, version)
 }
 
+// PlanMigrationWithGorp plans a migration using a gorp.Dialect instead of a dialect string
+func PlanMigrationWithGorp(db *sql.DB, dialect gorp.Dialect, m MigrationSource, dir MigrationDirection, max int) ([]*PlannedMigration, *gorp.DbMap, error) {
+	return migSet.PlanMigrationWithGorp(db, dialect, m, dir, max)
+}
+
+// PlanMigrationToVersionWithGorp plans a migration to a specific version using a gorp.Dialect instead of a dialect string
+func PlanMigrationToVersionWithGorp(db *sql.DB, dialect gorp.Dialect, m MigrationSource, dir MigrationDirection, version int64) ([]*PlannedMigration, *gorp.DbMap, error) {
+	return migSet.PlanMigrationToVersionWithGorp(db, dialect, m, dir, version)
+}
+
 // Plan a migration.
 func (ms MigrationSet) PlanMigration(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, max int) ([]*PlannedMigration, *gorp.DbMap, error) {
 	return ms.planMigrationCommon(db, dialect, m, dir, max, -1)
@@ -622,6 +740,19 @@ func (ms MigrationSet) PlanMigrationToVersion(db *sql.DB, dialect string, m Migr
 	return ms.planMigrationCommon(db, dialect, m, dir, 0, version)
 }
 
+// PlanMigrationWithGorp plans a migration using a gorp.Dialect directly
+func (ms MigrationSet) PlanMigrationWithGorp(db *sql.DB, dialect gorp.Dialect, m MigrationSource, dir MigrationDirection, max int) ([]*PlannedMigration, *gorp.DbMap, error) {
+	dbMap := &gorp.DbMap{Db: db, Dialect: dialect}
+	// Removed SetTableNameMapper logic
+	return ms.planMigrationImpl(dbMap, m, dir, max, -1)
+}
+
+func (ms MigrationSet) PlanMigrationToVersionWithGorp(db *sql.DB, dialect gorp.Dialect, m MigrationSource, dir MigrationDirection, version int64) ([]*PlannedMigration, *gorp.DbMap, error) {
+	dbMap := &gorp.DbMap{Db: db, Dialect: dialect}
+	// Removed SetTableNameMapper logic
+	return ms.planMigrationImpl(dbMap, m, dir, 0, version)
+}
+
 // A common method to plan a migration.
 func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirection, max int, version int64) ([]*PlannedMigration, *gorp.DbMap, error) {
 	dbMap, err := ms.getMigrationDbMap(db, dialect)
@@ -629,6 +760,11 @@ func (ms MigrationSet) planMigrationCommon(db *sql.DB, dialect string, m Migrati
 		return nil, nil, err
 	}
 
+	return ms.planMigrationImpl(dbMap, m, dir, max, version)
+}
+
+// planMigrationImpl is the implementation of the migration planner
+func (ms MigrationSet) planMigrationImpl(dbMap *gorp.DbMap, m MigrationSource, dir MigrationDirection, max int, version int64) ([]*PlannedMigration, *gorp.DbMap, error) {
 	migrations, err := m.FindMigrations()
 	if err != nil {
 		return nil, nil, err
@@ -769,22 +905,68 @@ func SkipMax(db *sql.DB, dialect string, m MigrationSource, dir MigrationDirecti
 	return applied, nil
 }
 
-// EnvironmentConfig holds the configuration for a database environment
-type EnvironmentConfig struct {
-	Dialect       string
-	DataSource    string
-	Dir           string
-	TableName     string
-	SchemaName    string
-	IgnoreUnknown bool
+// SkipMaxWithGorp is like SkipMax but works with gorp.Dialect directly
+func SkipMaxWithGorp(db *sql.DB, dialect gorp.Dialect, m MigrationSource, dir MigrationDirection, max int) (int, error) {
+	migrations, dbMap, err := PlanMigrationWithGorp(db, dialect, m, dir, max)
+	if err != nil {
+		return 0, err
+	}
+
+	// Skip migrations
+	applied := 0
+	for _, migration := range migrations {
+		var executor SqlExecutor
+
+		if migration.DisableTransaction {
+			executor = dbMap
+		} else {
+			executor, err = dbMap.Begin()
+			if err != nil {
+				return applied, newTxError(migration, err)
+			}
+		}
+
+		err = executor.Insert(&MigrationRecord{
+			Id:        migration.Id,
+			AppliedAt: time.Now(),
+		})
+		if err != nil {
+			if trans, ok := executor.(*gorp.Transaction); ok {
+				_ = trans.Rollback()
+			}
+
+			return applied, newTxError(migration, err)
+		}
+
+		if trans, ok := executor.(*gorp.Transaction); ok {
+			if err := trans.Commit(); err != nil {
+				return applied, newTxError(migration, err)
+			}
+		}
+
+		applied++
+	}
+
+	return applied, nil
+}
+
+// Environment holds the configuration for a database environment
+type Environment struct {
+	Dialect       string `yaml:"dialect"`
+	DataSource    string `yaml:"datasource"`
+	Dir           string `yaml:"dir"`
+	TableName     string `yaml:"table"`
+	SchemaName    string `yaml:"schema"`
+	IgnoreUnknown bool   `yaml:"ignoreunknown"`
+	Verbose       bool   `yaml:"verbose"`
 }
 
 // GetEnvironmentFromConfig creates an environment configuration from provided config data
 // This allows users to access environment configuration functionality from the library
 // without depending on the command-line tool's config.go implementation.
-func GetEnvironmentFromConfig(configData []byte, environment string) (*EnvironmentConfig, error) {
-	config := make(map[string]*EnvironmentConfig)
-	
+func GetEnvironmentFromConfig(configData []byte, environment string) (*Environment, error) {
+	config := make(map[string]*Environment)
+
 	err := yaml.Unmarshal(configData, config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
@@ -819,6 +1001,15 @@ func GetEnvironmentFromConfig(configData []byte, environment string) (*Environme
 	SetIgnoreUnknown(env.IgnoreUnknown)
 
 	return env, nil
+}
+
+// GetEnvironment loads environment configuration from a file
+func GetEnvironment(configFile, environment string) (*Environment, error) {
+	file, err := os.ReadFile(configFile)
+	if err != nil {
+		return nil, fmt.Errorf("error reading config file: %w", err)
+	}
+	return GetEnvironmentFromConfig(file, environment)
 }
 
 // Filter a slice of migrations into ones that should be applied.
